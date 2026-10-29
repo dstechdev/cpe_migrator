@@ -62,6 +62,39 @@ async function readBody(res) {
 
 async function fetchNewToken() {
   const cfg = getConfig();
+
+  // 1. Login via /api/v2/login (gera token Web aud=1 com permiss?o para /api/v1/rede/cpe)
+  try {
+    const webRes = await fetch(`${cfg.host}/api/v2/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({
+        username: cfg.username,
+        password: cfg.password,
+        revenda: null,
+        origem: 'web',
+        two_factor_required: false,
+        two_factor_type: null,
+      }),
+      signal: AbortSignal.timeout(cfg.timeoutMs),
+    });
+    const webData = await readBody(webRes);
+    if (webRes.ok && webData?.login?.access_token) {
+      const token = webData.login.access_token;
+      let ttl = 86400_000 * 5;
+      try {
+        const jwt = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
+        if (jwt.exp) ttl = Math.max(60_000, jwt.exp * 1000 - Date.now());
+      } catch {}
+      tokenState.accessToken = token;
+      tokenState.obtainedAt = Date.now();
+      tokenState.expiresAt = Date.now() + ttl;
+      tokenState.lastError = null;
+      audit({ type: 'auth', ok: true, mode: 'api_v2_login', expiresAt: new Date(tokenState.expiresAt).toISOString() });
+      return tokenState.accessToken;
+    }
+  } catch {}
+
   const body = new URLSearchParams({
     grant_type: 'password',
     client_id: cfg.clientId,
