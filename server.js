@@ -38,7 +38,8 @@ function audit(entry) {
 // ---------------------------------------------------------------------------
 // OAuth2 – token em cache com renovação automática
 // ---------------------------------------------------------------------------
-const Object.assign(tokenState, { accessToken: null,
+let tokenState = {
+  accessToken: null,
   expiresAt: 0, // epoch ms
   obtainedAt: 0,
   lastError: null,
@@ -103,7 +104,7 @@ function saveCachedToken(state) {
 async function fetchNewToken() {
   const cached = loadCachedToken();
   if (cached) {
-    Object.assign(tokenState, cached);
+    tokenState = cached;
     return tokenState.accessToken;
   }
 
@@ -136,10 +137,12 @@ async function fetchNewToken() {
   }
 
   const expiresInSec = Number(data.login.expires_in) || 432000;
-  Object.assign(tokenState, { accessToken: data.login.access_token,
+  tokenState = {
+    accessToken: data.login.access_token,
     expiresAt: Date.now() + expiresInSec * 1000,
     obtainedAt: new Date().toISOString(),
-    lastError: null });
+    lastError: null,
+  };
   saveCachedToken(tokenState);
   return tokenState.accessToken;
 }
