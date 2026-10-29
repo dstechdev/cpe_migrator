@@ -1,3 +1,4 @@
+const crypto = require("crypto");
 'use strict';
 
 require('dotenv').config();
@@ -60,68 +61,61 @@ async function readBody(res) {
   }
 }
 
+function generateTOTP(base32Secret) {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = "";
+  for (const ch of (base32Secret || "").replace(/=+$/, "").toUpperCase()) {
+    const val = alphabet.indexOf(ch);
+    if (val >= 0) bits += val.toString(2).padStart(5, "0");
+  }
+  const key = Buffer.alloc(Math.floor(bits.length / 8));
+  for (let i = 0; i < key.length; i++) {
+    key[i] = parseInt(bits.slice(i * 8, i * 8 + 8), 2);
+  }
+  const counter = Math.floor(Date.now() / 1000 / 30);
+  const buf = Buffer.alloc(8);
+  buf.writeBigUInt64BE(BigInt(counter));
+  const hmac = crypto.createHmac("sha1", key).update(buf).digest();
+  const offset = hmac[hmac.length - 1] & 0x0f;
+  return ((hmac.readUInt32BE(offset) & 0x7fffffff) % 1000000).toString().padStart(6, "0");
+}
+
 async function fetchNewToken() {
-  const cfg = getConfig();
+  const host = (process.env.HUBSOFT_HOST || "https://api.dstech.hubsoft.com.br").replace(/\/+$/, "");
+  const username = process.env.HUBSOFT_USERNAME;
+  const password = process.env.HUBSOFT_PASSWORD;
+  const totpSecret = process.env.HUBSOFT_TOTP_SECRET || "QJIWWJGLYKDX7NMR";
 
-  // 1. Login via /api/v2/login (gera token Web aud=1 com permiss?o para /api/v1/rede/cpe)
-  try {
-    const webRes = await fetch(`${cfg.host}/api/v2/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({
-        username: cfg.username,
-        password: cfg.password,
-        revenda: null,
-        origem: 'web',
-        two_factor_required: false,
-        two_factor_type: null,
-      }),
-      signal: AbortSignal.timeout(cfg.timeoutMs),
-    });
-    const webData = await readBody(webRes);
-    if (webRes.ok && webData?.login?.access_token) {
-      const token = webData.login.access_token;
-      let ttl = 86400_000 * 5;
-      try {
-        const jwt = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
-        if (jwt.exp) ttl = Math.max(60_000, jwt.exp * 1000 - Date.now());
-      } catch {}
-      tokenState.accessToken = token;
-      tokenState.obtainedAt = Date.now();
-      tokenState.expiresAt = Date.now() + ttl;
-      tokenState.lastError = null;
-      audit({ type: 'auth', ok: true, mode: 'api_v2_login', expiresAt: new Date(tokenState.expiresAt).toISOString() });
-      return tokenState.accessToken;
-    }
-  } catch {}
-
-  const body = new URLSearchParams({
-    grant_type: 'password',
-    client_id: cfg.clientId,
-    client_secret: cfg.clientSecret,
-    username: cfg.username,
-    password: cfg.password,
-  });
-
-  const res = await fetch(`${cfg.host}/oauth/token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
-    body,
-    signal: AbortSignal.timeout(cfg.timeoutMs),
-  });
-  const data = await readBody(res);
-
-  if (!res.ok || !data || !data.access_token) {
-    const msg = typeof data === 'string' ? data.slice(0, 500) : JSON.stringify(data);
-    throw new Error(`OAuth falhou (HTTP ${res.status}): ${msg}`);
+  if (!host || !username || !password) {
+    throw new Error("Credenciais HubSoft incompletas no .env");
   }
 
-  const ttl = Number(data.expires_in) > 0 ? Number(data.expires_in) * 1000 : 3600_000;
-  tokenState.accessToken = data.access_token;
-  tokenState.obtainedAt = Date.now();
-  tokenState.expiresAt = Date.now() + ttl;
-  tokenState.lastError = null;
-  audit({ type: 'auth', ok: true, expiresAt: new Date(tokenState.expiresAt).toISOString() });
+  const res = await fetch(`${host}/api/v2/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({
+      username,
+      password,
+      revenda: null,
+      one_time_password: generateTOTP(totpSecret),
+      origem: "web",
+      two_factor_required: true,
+      two_factor_type: "app",
+    }),
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.status !== "success" || !data.login || !data.login.access_token) {
+    throw new Error(`Falha no login HubSoft (${res.status}): ${data.msg || JSON.stringify(data)}`);
+  }
+
+  const expiresInSec = Number(data.login.expires_in) || 432000;
+  tokenState = {
+    accessToken: data.login.access_token,
+    expiresAt: Date.now() + expiresInSec * 1000,
+    obtainedAt: new Date().toISOString(),
+    lastError: null,
+  };
   return tokenState.accessToken;
 }
 
