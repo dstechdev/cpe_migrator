@@ -80,7 +80,34 @@ function generateTOTP(base32Secret) {
   return ((hmac.readUInt32BE(offset) & 0x7fffffff) % 1000000).toString().padStart(6, "0");
 }
 
+const TOKEN_CACHE_FILE = path.join(__dirname, "logs", "token-cache.json");
+
+function loadCachedToken() {
+  try {
+    if (fs.existsSync(TOKEN_CACHE_FILE)) {
+      const data = JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE, "utf8"));
+      if (data && data.accessToken && data.expiresAt && Date.now() < data.expiresAt - 300000) {
+        return data;
+      }
+    }
+  } catch (_) {}
+  return null;
+}
+
+function saveCachedToken(state) {
+  try {
+    fs.mkdirSync(path.dirname(TOKEN_CACHE_FILE), { recursive: true });
+    fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(state, null, 2), "utf8");
+  } catch (_) {}
+}
+
 async function fetchNewToken() {
+  const cached = loadCachedToken();
+  if (cached) {
+    tokenState = cached;
+    return tokenState.accessToken;
+  }
+
   const host = (process.env.HUBSOFT_HOST || "https://api.dstech.hubsoft.com.br").replace(/\/+$/, "");
   const username = process.env.HUBSOFT_USERNAME;
   const password = process.env.HUBSOFT_PASSWORD;
@@ -116,6 +143,7 @@ async function fetchNewToken() {
     obtainedAt: new Date().toISOString(),
     lastError: null,
   };
+  saveCachedToken(tokenState);
   return tokenState.accessToken;
 }
 
