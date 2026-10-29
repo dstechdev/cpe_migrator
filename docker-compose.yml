@@ -1,0 +1,11 @@
+﻿services:
+  hubsoft-cpe-migrator:
+    build: .
+    container_name: hubsoft-cpe-migrator
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
