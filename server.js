@@ -254,6 +254,86 @@ async function hubsoftGet(endpoint) {
 // ---------------------------------------------------------------------------
 const app = express();
 app.use(express.json({ limit: '1mb' }));
+
+// === APP_AUTH_START ===
+const APP_SESSION_SECRET = process.env.APP_SESSION_SECRET || crypto.createHash("sha256").update((process.env.HUBSOFT_PASSWORD || "dstech") + "_cpe_salt").digest("hex");
+const loginAttempts = new Map();
+
+function createSessionToken(user) {
+  const exp = Date.now() + 7 * 24 * 60 * 60 * 1000;
+  const payload = Buffer.from(JSON.stringify({ u: user, exp })).toString("base64url");
+  const sig = crypto.createHmac("sha256", APP_SESSION_SECRET).update(payload).digest("base64url");
+  return payload + "." + sig;
+}
+
+function verifySessionToken(token) {
+  if (!token || typeof token !== "string" || !token.includes(".")) return null;
+  const [payload, sig] = token.split(".");
+  const expected = crypto.createHmac("sha256", APP_SESSION_SECRET).update(payload).digest("base64url");
+  if (sig !== expected) return null;
+  try {
+    const data = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    if (!data.exp || Date.now() > data.exp) return null;
+    return data.u;
+  } catch (_) { return null; }
+}
+
+function parseCookies(req) {
+  const list = {};
+  const rc = req.headers.cookie;
+  if (rc) {
+    rc.split(";").forEach((c) => {
+      const p = c.split("=");
+      const k = p.shift().trim();
+      if (k) list[k] = decodeURIComponent(p.join("="));
+    });
+  }
+  return list;
+}
+
+app.get("/login", (req, res) => {
+  if (verifySessionToken(parseCookies(req).cpe_session)) return res.redirect("/");
+  res.sendFile(path.join(__dirname, "public", "login.html"));
+});
+
+app.get("/styles.css", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "styles.css"));
+});
+
+app.post("/api/app-login", (req, res) => {
+  const ip = req.ip || "unknown";
+  const rec = loginAttempts.get(ip) || { count: 0, lockUntil: 0 };
+  if (Date.now() < rec.lockUntil) {
+    return res.status(429).json({ ok: false, error: "Muitas tentativas. Aguarde alguns minutos." });
+  }
+  const { username, password } = req.body || {};
+  const validUser = process.env.APP_ADMIN_USER || "admin";
+  const validPass = process.env.APP_ADMIN_PASS || "Dstech677!";
+  if (username === validUser && password === validPass) {
+    loginAttempts.delete(ip);
+    const token = createSessionToken(username);
+    res.setHeader("Set-Cookie", "cpe_session=" + token + "; HttpOnly; Path=/; Max-Age=604800; SameSite=Lax");
+    return res.json({ ok: true, user: username });
+  }
+  rec.count += 1;
+  if (rec.count >= 5) { rec.lockUntil = Date.now() + 5 * 60 * 1000; rec.count = 0; }
+  loginAttempts.set(ip, rec);
+  return res.status(401).json({ ok: false, error: "Usuario ou senha incorretos." });
+});
+
+app.post("/api/app-logout", (req, res) => {
+  res.setHeader("Set-Cookie", "cpe_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax");
+  res.json({ ok: true });
+});
+
+app.use((req, res, next) => {
+  const user = verifySessionToken(parseCookies(req).cpe_session);
+  if (user) { req.appUser = user; return next(); }
+  if (req.path.startsWith("/api/")) return res.status(401).json({ ok: false, error: "Nao autenticado." });
+  return res.redirect("/login");
+});
+// === APP_AUTH_END ===
+
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.get('/api/status', (_req, res) => {
