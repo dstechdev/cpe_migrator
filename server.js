@@ -398,8 +398,8 @@ app.post('/api/convert', (req, res) => {
 });
 
 /**
- * Resolve automaticamente se o ID informado é id_cliente_servico, id_cliente (da URL do navegador) ou codigo_cliente.
- * Quando um serial (conv) é informado, garante que o serviço resolvido pertence àquele serial ou faz a busca automática pelo id_cliente/codigo_cliente.
+ * Resolve automaticamente se o ID informado é id_cliente_servico, id_cliente_servico_autenticacao, id_cliente (da URL do navegador) ou codigo_cliente.
+ * Nota importante do HubSoft: a rota GET /api/v1/cliente/servico/autenticacao/{id} recebe id_cliente_servico_autenticacao (que em serviços recentes como 81966 difere do id_cliente_servico!).
  */
 async function resolveServiceAuth(inputId, conv = null) {
   const getAuth = await hubsoftGet(`/api/v1/cliente/servico/autenticacao/${inputId}`);
@@ -419,49 +419,82 @@ async function resolveServiceAuth(inputId, conv = null) {
     return d.includes('(INATIVO)') || d.includes('CANCELADO');
   };
 
-  // Se o id_cliente_servico existe, está ativo e o serial bate (ou não foi informado serial na consulta simples), usa direto
-  if (authObj && !isCancelled(authObj) && (!conv || matchesSerial(authObj.phy_addr))) {
-    return { resolvedId: inputId, authObj, resolvedFrom: null };
+  // Só usa direto se o registro de autenticação realmente pertencer ao id_cliente_servico == inputId e o serial bater
+  if (
+    authObj &&
+    Number(authObj.id_cliente_servico) === Number(inputId) &&
+    !isCancelled(authObj) &&
+    (!conv || matchesSerial(authObj.phy_addr))
+  ) {
+    return {
+      resolvedId: Number(authObj.id_cliente_servico),
+      authId: Number(authObj.id_cliente_servico_autenticacao || inputId),
+      authObj,
+      resolvedFrom: null,
+    };
   }
 
-  // Tenta resolver assumindo que inputId é id_cliente (da URL /cliente/editar/{id_cliente}/servico) ou codigo_cliente
-  for (const tipo of ['id_cliente', 'codigo_cliente']) {
+  // Busca primeiro por id_cliente_servico (para descobrir o id_cliente_servico_autenticacao real quando divergem, ex: 81966 -> auth 81867),
+  // e depois por id_cliente (da URL /cliente/editar/{id_cliente}/servico) ou codigo_cliente
+  for (const tipo of ['id_cliente_servico', 'id_cliente', 'codigo_cliente']) {
     const search = await hubsoftGet(`/api/v1/integracao/cliente?busca=${tipo}&termo_busca=${inputId}`);
     const clientes = search.response?.clientes || [];
     for (const cli of clientes) {
       const servicos = cli.servicos || [];
-      // 1º: Prioriza serviço cujo phy_addr bate exatamente com o serial informado (raw ou hex)
+      // 1º: Prioriza serviço cujo phy_addr bate exatamente com o serial informado (raw, hex ou vendor+suffix)
       if (conv) {
         for (const s of servicos) {
-          if (matchesSerial(s.phy_addr)) {
-            const subAuth = await hubsoftGet(`/api/v1/cliente/servico/autenticacao/${s.id_cliente_servico}`);
+          if (matchesSerial(s.phy_addr) || (tipo === 'id_cliente_servico' && Number(s.id_cliente_servico) === Number(inputId))) {
+            const targetAuthId = Number(s.id_cliente_servico_autenticacao || s.id_cliente_servico);
+            const subAuth = await hubsoftGet(`/api/v1/cliente/servico/autenticacao/${targetAuthId}`);
             if (subAuth.ok && subAuth.response?.cliente_servico_autenticacao) {
-              return {
-                resolvedId: Number(s.id_cliente_servico),
-                authObj: subAuth.response.cliente_servico_autenticacao,
-                resolvedFrom: `${tipo}:${inputId} -> id_cliente_servico:${s.id_cliente_servico} (${cli.nome_razaosocial})`,
-              };
+              const aObj = subAuth.response.cliente_servico_autenticacao;
+              if (!conv || matchesSerial(aObj.phy_addr) || matchesSerial(s.phy_addr)) {
+                return {
+                  resolvedId: Number(s.id_cliente_servico),
+                  authId: targetAuthId,
+                  authObj: aObj,
+                  resolvedFrom:
+                    tipo === 'id_cliente_servico' && Number(s.id_cliente_servico) === Number(inputId)
+                      ? null
+                      : `${tipo}:${inputId} -> id_cliente_servico:${s.id_cliente_servico} (${cli.nome_razaosocial})`,
+                };
+              }
             }
           }
         }
       }
-      // 2º: Se for apenas consulta sem serial, procura serviço ativo do cliente
-      const activeServices = servicos.filter((s) => !String(s.status || '').toLowerCase().includes('cancelado'));
-      if (activeServices.length === 1 && !conv) {
-        const s = activeServices[0];
-        const subAuth = await hubsoftGet(`/api/v1/cliente/servico/autenticacao/${s.id_cliente_servico}`);
+      // 2º: Se for apenas consulta sem serial, procura o serviço correspondente ou ativo do cliente
+      const candidates =
+        tipo === 'id_cliente_servico'
+          ? servicos.filter((s) => Number(s.id_cliente_servico) === Number(inputId))
+          : servicos.filter((s) => !String(s.status || '').toLowerCase().includes('cancelado'));
+      if (candidates.length === 1 && !conv) {
+        const s = candidates[0];
+        const targetAuthId = Number(s.id_cliente_servico_autenticacao || s.id_cliente_servico);
+        const subAuth = await hubsoftGet(`/api/v1/cliente/servico/autenticacao/${targetAuthId}`);
         if (subAuth.ok && subAuth.response?.cliente_servico_autenticacao) {
           return {
             resolvedId: Number(s.id_cliente_servico),
+            authId: targetAuthId,
             authObj: subAuth.response.cliente_servico_autenticacao,
-            resolvedFrom: `${tipo}:${inputId} -> id_cliente_servico:${s.id_cliente_servico} (${cli.nome_razaosocial})`,
+            resolvedFrom:
+              tipo === 'id_cliente_servico'
+                ? null
+                : `${tipo}:${inputId} -> id_cliente_servico:${s.id_cliente_servico} (${cli.nome_razaosocial})`,
           };
         }
       }
     }
   }
 
-  return { resolvedId: inputId, authObj, resolvedFrom: null, rawResponse: getAuth };
+  return {
+    resolvedId: inputId,
+    authId: Number(authObj?.id_cliente_servico_autenticacao || inputId),
+    authObj,
+    resolvedFrom: null,
+    rawResponse: getAuth,
+  };
 }
 
 /**
@@ -671,8 +704,9 @@ app.post('/api/migrate', async (req, res) => {
     // 4. Cadastrar e vincular CPE na tabela de CPEs Vinculadas ao Assinante (/api/v1/rede/cpe)
     if (!alreadyHasNewCpeOnly) {
       try {
-        // Reconsulta autenticação pós-desvínculo para garantir cpes: [] limpo e evitar erro de porta ocupada
-        const freshAuthGet = await hubsoftGet(`/api/v1/cliente/servico/autenticacao/${targetId}`);
+        // Reconsulta autenticação pós-desvínculo usando o id_cliente_servico_autenticacao real (authId)
+        const targetAuthId = resolved.authId || targetId;
+        const freshAuthGet = await hubsoftGet(`/api/v1/cliente/servico/autenticacao/${targetAuthId}`);
         const freshAuth = freshAuthGet.response?.cliente_servico_autenticacao || authRaw;
         if (freshAuth && freshAuth.equipamento_conexao && freshAuth.interface_conexao) {
           const cpePayload = {
