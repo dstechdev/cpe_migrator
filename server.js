@@ -398,6 +398,70 @@ app.post('/api/convert', (req, res) => {
 });
 
 /**
+ * Resolve automaticamente se o ID informado é id_cliente_servico, id_cliente (da URL do navegador) ou codigo_cliente.
+ * Quando um serial (conv) é informado, garante que o serviço resolvido pertence àquele serial ou faz a busca automática pelo id_cliente/codigo_cliente.
+ */
+async function resolveServiceAuth(inputId, conv = null) {
+  const getAuth = await hubsoftGet(`/api/v1/cliente/servico/autenticacao/${inputId}`);
+  const authObj = getAuth.ok ? getAuth.response?.cliente_servico_autenticacao : null;
+
+  const matchesSerial = (phy) => {
+    if (!conv || !phy) return false;
+    const p = String(phy).trim().toUpperCase();
+    return p === String(conv.raw || '').toUpperCase() || p === String(conv.hex || '').toUpperCase();
+  };
+
+  const isCancelled = (a) => {
+    const d = String(a?.cliente_servico?.display || '').toUpperCase();
+    return d.includes('(INATIVO)') || d.includes('CANCELADO');
+  };
+
+  // Se o id_cliente_servico existe, está ativo e o serial bate (ou não foi informado serial na consulta simples), usa direto
+  if (authObj && !isCancelled(authObj) && (!conv || matchesSerial(authObj.phy_addr))) {
+    return { resolvedId: inputId, authObj, resolvedFrom: null };
+  }
+
+  // Tenta resolver assumindo que inputId é id_cliente (da URL /cliente/editar/{id_cliente}/servico) ou codigo_cliente
+  for (const tipo of ['id_cliente', 'codigo_cliente']) {
+    const search = await hubsoftGet(`/api/v1/integracao/cliente?busca=${tipo}&termo_busca=${inputId}`);
+    const clientes = search.response?.clientes || [];
+    for (const cli of clientes) {
+      const servicos = cli.servicos || [];
+      // 1º: Prioriza serviço cujo phy_addr bate exatamente com o serial informado (raw ou hex)
+      if (conv) {
+        for (const s of servicos) {
+          if (matchesSerial(s.phy_addr)) {
+            const subAuth = await hubsoftGet(`/api/v1/cliente/servico/autenticacao/${s.id_cliente_servico}`);
+            if (subAuth.ok && subAuth.response?.cliente_servico_autenticacao) {
+              return {
+                resolvedId: Number(s.id_cliente_servico),
+                authObj: subAuth.response.cliente_servico_autenticacao,
+                resolvedFrom: `${tipo}:${inputId} -> id_cliente_servico:${s.id_cliente_servico} (${cli.nome_razaosocial})`,
+              };
+            }
+          }
+        }
+      }
+      // 2º: Se for apenas consulta sem serial, procura serviço ativo do cliente
+      const activeServices = servicos.filter((s) => !String(s.status || '').toLowerCase().includes('cancelado'));
+      if (activeServices.length === 1 && !conv) {
+        const s = activeServices[0];
+        const subAuth = await hubsoftGet(`/api/v1/cliente/servico/autenticacao/${s.id_cliente_servico}`);
+        if (subAuth.ok && subAuth.response?.cliente_servico_autenticacao) {
+          return {
+            resolvedId: Number(s.id_cliente_servico),
+            authObj: subAuth.response.cliente_servico_autenticacao,
+            resolvedFrom: `${tipo}:${inputId} -> id_cliente_servico:${s.id_cliente_servico} (${cli.nome_razaosocial})`,
+          };
+        }
+      }
+    }
+  }
+
+  return { resolvedId: inputId, authObj, resolvedFrom: null, rawResponse: getAuth };
+}
+
+/**
  * Consulta prévia dos dados de autenticação e conexão do cliente no HubSoft
  */
 app.get('/api/client/:id', async (req, res) => {
@@ -407,19 +471,21 @@ app.get('/api/client/:id', async (req, res) => {
   }
 
   try {
-    const authGet = await hubsoftGet(`/api/v1/cliente/servico/autenticacao/${id}`);
-    if (!authGet.ok || !authGet.response || !authGet.response.cliente_servico_autenticacao) {
-      return res.status(authGet.httpStatus || 404).json({
+    const resolved = await resolveServiceAuth(id, null);
+    if (!resolved.authObj) {
+      return res.status(resolved.rawResponse?.httpStatus || 404).json({
         ok: false,
-        error: authGet.message || 'Serviço do cliente não encontrado no HubSoft.',
+        error: resolved.rawResponse?.message || 'Serviço do cliente não encontrado no HubSoft.',
       });
     }
 
-    const a = authGet.response.cliente_servico_autenticacao;
+    const a = resolved.authObj;
     const cpesVinculadas = Array.isArray(a.cpes) ? a.cpes.map((c) => c.phy_addr).filter(Boolean) : [];
     res.json({
       ok: true,
-      id_cliente_servico: id,
+      id_cliente_servico: resolved.resolvedId,
+      input_id: id,
+      resolved_from: resolved.resolvedFrom,
       login: a.login,
       mac_addr: a.mac_addr,
       phy_addr: a.phy_addr,
@@ -496,46 +562,66 @@ app.post('/api/migrate', async (req, res) => {
   }
 
   try {
-    // 1. Consulta e preserva a interface de conexão e equipamento de conexão atuais
+    // 1. Consulta e preserva a interface de conexão e equipamento de conexão atuais (auto-resolvendo id_cliente -> id_cliente_servico se necessário)
     let currentInterfaceId = null;
     let currentOltName = null;
     let currentInterfaceName = null;
     let currentPhyAddr = null;
     let authRaw = null;
 
-    try {
-      const getAuth = await hubsoftGet(`/api/v1/cliente/servico/autenticacao/${id}`);
-      if (getAuth.ok && getAuth.response && getAuth.response.cliente_servico_autenticacao) {
-        const authObj = getAuth.response.cliente_servico_autenticacao;
-        authRaw = authObj;
-        currentInterfaceId = authObj.id_interface_conexao || authObj.interface_conexao?.id_interface_conexao || null;
-        currentOltName = authObj.equipamento_conexao?.nome || null;
-        currentInterfaceName = authObj.interface_conexao?.nome || null;
-        currentPhyAddr = authObj.phy_addr || null;
-        result.info = {
-          olt: currentOltName,
-          interface: currentInterfaceName,
-          id_interface_conexao: currentInterfaceId,
-          oldPhyAddr: currentPhyAddr,
-        };
-        result.steps.push({
-          step: 'consultar_autenticacao',
-          ok: true,
-          detail: `OLT: ${currentOltName || 'N/A'} | Interface: ${currentInterfaceName || 'N/A'} (ID: ${currentInterfaceId})`,
-        });
-      } else {
+    const resolved = await resolveServiceAuth(id, conv);
+    const targetId = resolved.resolvedId;
+    result.id_cliente_servico = targetId;
+    if (resolved.resolvedFrom) {
+      result.input_id = id;
+      result.resolved_from = resolved.resolvedFrom;
+      result.steps.push({
+        step: 'resolver_id_servico',
+        ok: true,
+        detail: `ID informado (${id}) era id_cliente/código; convertido automaticamente para id_cliente_servico ${targetId} -> ${resolved.resolvedFrom}`,
+      });
+    }
+
+    if (resolved.authObj) {
+      const authObj = resolved.authObj;
+      authRaw = authObj;
+      currentInterfaceId = authObj.id_interface_conexao || authObj.interface_conexao?.id_interface_conexao || null;
+      currentOltName = authObj.equipamento_conexao?.nome || null;
+      currentInterfaceName = authObj.interface_conexao?.nome || null;
+      currentPhyAddr = authObj.phy_addr || null;
+      const clienteDisplay = authObj.cliente_servico?.display || 'N/A';
+
+      // Trava de segurança anti-sobrescrita: se o serviço possui outro serial diferente do informado (nem raw nem hex), aborta!
+      const cleanOld = String(currentPhyAddr || '').trim().toUpperCase();
+      if (cleanOld && cleanOld !== conv.raw.toUpperCase() && cleanOld !== conv.hex.toUpperCase()) {
+        result.error = `Trava de segurança: O serviço ${targetId} (${clienteDisplay}) está com o serial "${currentPhyAddr}", que não corresponde ao serial informado ("${serial}"). Verifique se o ID pertence a este cliente.`;
         result.steps.push({
           step: 'consultar_autenticacao',
           ok: false,
-          warning: 'Não foi possível ler autenticação prévia; prosseguindo sem id_interface_conexao prévio.',
-          message: getAuth.message,
+          error: result.error,
         });
+        audit({ type: 'migrate', ...result });
+        return res.status(422).json(result);
       }
-    } catch (err) {
+
+      result.info = {
+        cliente: clienteDisplay,
+        olt: currentOltName,
+        interface: currentInterfaceName,
+        id_interface_conexao: currentInterfaceId,
+        oldPhyAddr: currentPhyAddr,
+      };
+      result.steps.push({
+        step: 'consultar_autenticacao',
+        ok: true,
+        detail: `Cliente: ${clienteDisplay} | OLT: ${currentOltName || 'N/A'} | Interface: ${currentInterfaceName || 'N/A'} (ID: ${currentInterfaceId})`,
+      });
+    } else {
       result.steps.push({
         step: 'consultar_autenticacao',
         ok: false,
-        warning: `Erro na consulta prévia: ${err.message}`,
+        warning: 'Não foi possível ler autenticação prévia; prosseguindo sem id_interface_conexao prévio.',
+        message: resolved.rawResponse?.message,
       });
     }
 
@@ -546,7 +632,7 @@ app.post('/api/migrate', async (req, res) => {
       linkedCpes.length === 1 && String(linkedCpes[0].phy_addr || '').toUpperCase() === conv.hex.toUpperCase();
 
     if ((!skipUnlink || hasOldCpe) && !alreadyHasNewCpeOnly) {
-      const unlink = await hubsoftPost('/api/v1/integracao/cliente/desvincular_cpe', { id_cliente_servico: id });
+      const unlink = await hubsoftPost('/api/v1/integracao/cliente/desvincular_cpe', { id_cliente_servico: targetId });
       const noCpeLinked = unlink.message && unlink.message.includes('não possui CPE vinculada');
       result.steps.push({
         step: 'desvincular_cpe',
@@ -557,7 +643,7 @@ app.post('/api/migrate', async (req, res) => {
 
     // 3. Configurar autenticação (atualiza o MAC Layer 2 no HubSoft via API de integração)
     const authPayload = {
-      id_cliente_servico: id,
+      id_cliente_servico: targetId,
       phy_addr: conv.hex,
     };
 
@@ -580,7 +666,7 @@ app.post('/api/migrate', async (req, res) => {
     if (!alreadyHasNewCpeOnly) {
       try {
         // Reconsulta autenticação pós-desvínculo para garantir cpes: [] limpo e evitar erro de porta ocupada
-        const freshAuthGet = await hubsoftGet(`/api/v1/cliente/servico/autenticacao/${id}`);
+        const freshAuthGet = await hubsoftGet(`/api/v1/cliente/servico/autenticacao/${targetId}`);
         const freshAuth = freshAuthGet.response?.cliente_servico_autenticacao || authRaw;
         if (freshAuth && freshAuth.equipamento_conexao && freshAuth.interface_conexao) {
           const cpePayload = {
@@ -596,7 +682,7 @@ app.post('/api/migrate', async (req, res) => {
             request: {
               endpoint: '/api/v1/rede/cpe',
               payload: {
-                id_cliente_servico: id,
+                id_cliente_servico: targetId,
                 id_equipamento_conexao: freshAuth.equipamento_conexao.id_equipamento_conexao,
                 id_interface_conexao: freshAuth.interface_conexao.id_interface_conexao,
                 phy_addr: conv.hex,
@@ -612,7 +698,7 @@ app.post('/api/migrate', async (req, res) => {
     // 5. Confirmar vínculo de CPE na autenticação (/api/v1/integracao/cliente/vincular_cpe)
     try {
       const link = await hubsoftPost('/api/v1/integracao/cliente/vincular_cpe', {
-        id_cliente_servico: id,
+        id_cliente_servico: targetId,
       });
       result.steps.push({ step: 'vincular_cpe', ...link });
       if (!link.ok) {
