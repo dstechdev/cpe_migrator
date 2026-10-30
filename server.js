@@ -326,6 +326,42 @@ app.post("/api/app-logout", (req, res) => {
   res.json({ ok: true });
 });
 
+const N8N_BRIDGE_API_KEY = process.env.N8N_BRIDGE_API_KEY || "dstech_n8n_secret_2026";
+
+app.get("/api/n8n-token-hubsoft", async (req, res) => {
+  try {
+    const authHeader = req.headers["authorization"] || "";
+    const bearerKey = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+    const providedKey = req.headers["x-api-key"] || bearerKey || req.query.api_key;
+
+    if (!providedKey || providedKey !== N8N_BRIDGE_API_KEY) {
+      return res.status(401).json({
+        status: "error",
+        message: "Nao autorizado. Informe um x-api-key valido.",
+      });
+    }
+
+    const forceRefresh = req.query.force === "true" || req.query.force === "1";
+    const accessToken = await getToken({ force: forceRefresh });
+    const remainingSeconds = tokenState.expiresAt
+      ? Math.max(0, Math.floor((tokenState.expiresAt - Date.now()) / 1000))
+      : null;
+
+    return res.status(200).json({
+      status: "success",
+      access_token: accessToken,
+      token_type: "Bearer",
+      expires_in: remainingSeconds,
+      obtained_at: tokenState.obtainedAt,
+    });
+  } catch (error) {
+    return res.status(502).json({
+      status: "error",
+      message: error.message || "Falha ao obter token HubSoft com 2FA",
+    });
+  }
+});
+
 app.use((req, res, next) => {
   const user = verifySessionToken(parseCookies(req).cpe_session);
   if (user) { req.appUser = user; return next(); }
