@@ -50,6 +50,7 @@
       return {
         ok: true,
         input,
+        raw: s,
         hex: s,
         vendor: /^[\x20-\x7E]{4}$/.test(vendor) ? vendor : '????',
         vendorHex: s.slice(0, 8),
@@ -70,7 +71,7 @@
       const vendorHex = Array.from(vendor)
         .map((c) => c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'))
         .join('');
-      return { ok: true, input, hex: vendorHex + suffix, vendor, vendorHex, suffix, alreadyHex: false };
+      return { ok: true, input, raw: s, hex: vendorHex + suffix, vendor, vendorHex, suffix, alreadyHex: false };
     }
 
     return {

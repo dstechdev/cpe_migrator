@@ -408,7 +408,10 @@ async function resolveServiceAuth(inputId, conv = null) {
   const matchesSerial = (phy) => {
     if (!conv || !phy) return false;
     const p = String(phy).trim().toUpperCase();
-    return p === String(conv.raw || '').toUpperCase() || p === String(conv.hex || '').toUpperCase();
+    const rawStr = String(conv.input || conv.raw || '').replace(/[\s:\-]/g, '').toUpperCase();
+    const hexStr = String(conv.hex || '').trim().toUpperCase();
+    const vendorSuffix = String((conv.vendor || '') + (conv.suffix || '')).trim().toUpperCase();
+    return p === rawStr || p === hexStr || (vendorSuffix.length === 12 && p === vendorSuffix);
   };
 
   const isCancelled = (a) => {
@@ -591,9 +594,12 @@ app.post('/api/migrate', async (req, res) => {
       currentPhyAddr = authObj.phy_addr || null;
       const clienteDisplay = authObj.cliente_servico?.display || 'N/A';
 
-      // Trava de segurança anti-sobrescrita: se o serviço possui outro serial diferente do informado (nem raw nem hex), aborta!
+      // Trava de segurança anti-sobrescrita: se o serviço possui outro serial diferente do informado (nem input, nem hex, nem vendor+suffix), aborta!
       const cleanOld = String(currentPhyAddr || '').trim().toUpperCase();
-      if (cleanOld && cleanOld !== conv.raw.toUpperCase() && cleanOld !== conv.hex.toUpperCase()) {
+      const rawStr = String(conv.input || conv.raw || '').replace(/[\s:\-]/g, '').toUpperCase();
+      const hexStr = String(conv.hex || '').trim().toUpperCase();
+      const vendorSuffix = String((conv.vendor || '') + (conv.suffix || '')).trim().toUpperCase();
+      if (cleanOld && cleanOld !== rawStr && cleanOld !== hexStr && cleanOld !== vendorSuffix) {
         result.error = `Trava de segurança: O serviço ${targetId} (${clienteDisplay}) está com o serial "${currentPhyAddr}", que não corresponde ao serial informado ("${serial}"). Verifique se o ID pertence a este cliente.`;
         result.steps.push({
           step: 'consultar_autenticacao',
